@@ -1,10 +1,15 @@
-require("dotenv").config();
 const express = require("express");
 const mysql = require("mysql2");
+const Ajv = require("ajv");
+const ajvFormats = require("ajv-formats");
+const dotenv = require("dotenv");
+
+dotenv.config(); // Lädt die Umgebungsvariablen aus der .env-Datei
+
 const app = express();
 const port = 3000;
 
-// Datenbank-Verbindung einrichten
+// Datenbankverbindung mit mysql.createConnection() (wie in Code 2)
 const db = mysql.createConnection({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -13,68 +18,60 @@ const db = mysql.createConnection({
   database: process.env.DB_NAME,
 });
 
+// Verbindung testen
 db.connect((err) => {
   if (err) {
     console.error("Datenbankverbindung fehlgeschlagen:", err);
-    process.exit(1);
+    process.exit(1); // Beendet den Server, wenn die Verbindung fehlschlägt
   }
   console.log("Mit MySQL verbunden!");
 });
 
+// AJV Schema-Validator mit Formaten
+const ajv = new Ajv();
+ajvFormats(ajv);  // Aktiviert alle Formate wie 'email', 'uri', etc.
+
+const schema = {
+  type: "object",
+  properties: {
+    vorname: { type: "string" },
+    nachname: { type: "string" },
+    plz: { type: "integer" },
+    strasse: { type: "string" },
+    ort: { type: "string" },
+    telefonnummer: { type: "integer" },
+    email: { type: "string", format: "email" }  // Aktiviert die E-Mail-Validierung
+  },
+  required: ["vorname", "nachname", "email"], // Vorname, Nachname und Email sind erforderlich
+  additionalProperties: false
+};
+
+const validate = ajv.compile(schema);
+
 app.use(express.json());
 
-// Route für die Startseite
-app.get("/", (req, res) => {
-  res.send("Willkommen beim REST-Server!");
-});
+// Route: Teste das JSON-Format mit AJV
+app.post("/validate", (req, res) => {
+  const data = req.body;
 
-// Route für /hello mit Query-Param
-app.get("/hello", (req, res) => {
-  const name = req.query.name;
-  if (!name) return res.status(400).send("Name fehlt");
+  const valid = validate(data);
+  if (!valid) {
+    console.log(validate.errors);
+    return res.status(400).send({ message: "Ungültige Daten", errors: validate.errors });
+  }
 
-  db.query(
-    "INSERT INTO greetings (name, source) VALUES (?, ?)",
-    [name, "query"],
-    (err) => {
-      if (err) return res.status(500).send("Fehler beim Einfügen in die DB");
-      res.send("Hallo, mein Query ist: " + name);
-    }
-  );
-});
-
-// Route für /hello/:name mit URL-Param
-app.get("/hello/:name", (req, res) => {
-  const name = req.params.name;
-
-  db.query(
-    "INSERT INTO greetings (name, source) VALUES (?, ?)",
-    [name, "param"],
-    (err) => {
-      if (err) return res.status(500).send("Fehler beim Einfügen in die DB");
-      res.send("Hallo, mein Name ist auch " + name);
-    }
-  );
-});
-
-// Route für POST /hello/body mit JSON
-app.post("/hello/body", (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).send("JSON muss ein 'name'-Feld enthalten");
-
-  db.query(
-    "INSERT INTO greetings (name, source) VALUES (?, ?)",
-    [name, "body"],
-    (err) => {
-      if (err) return res.status(500).send("Fehler beim Einfügen in die DB");
-      res.send({ message: "Name gespeichert", name });
-    }
-  );
+  return res.status(200).send({ message: "Daten sind gültig!" });
 });
 
 // Route: POST /person für das Hinzufügen einer Person
 app.post("/person", (req, res) => {
   const { vorname, nachname, plz, strasse, ort, telefonnummer, email } = req.body;
+
+  // Validierung des Datenformats
+  const valid = validate(req.body);
+  if (!valid) {
+    return res.status(400).send({ message: "Ungültige Daten", errors: validate.errors });
+  }
 
   if (!vorname || !nachname || !email) {
     return res.status(400).send("Vorname, Nachname und E-Mail sind erforderlich");
@@ -86,7 +83,7 @@ app.post("/person", (req, res) => {
   `;
   const values = [vorname, nachname, plz, strasse, ort, telefonnummer, email];
 
-  db.query(query, values, (err, result) => {
+  db.execute(query, values, (err, result) => {
     if (err) {
       console.error("Fehler beim Einfügen der Person:", err);
       return res.status(500).send("Fehler beim Speichern der Person");
@@ -97,39 +94,18 @@ app.post("/person", (req, res) => {
 
 // Route: GET /person für das Abrufen aller Personen
 app.get("/person", (req, res) => {
-  db.query("SELECT * FROM personen", (err, results) => {
-    if (err) return res.status(500).send("Fehler beim Abrufen der Personen");
-    res.status(200).json(results);
+  const query = "SELECT * FROM personen";
+
+  db.query(query, (err, rows) => {
+    if (err) {
+      console.error("Fehler beim Abrufen der Personen:", err);
+      return res.status(500).send("Fehler beim Abrufen der Personen");
+    }
+    res.status(200).json(rows);
   });
 });
 
-// Route: GET /person/:id für das Abrufen einer Person nach ID
-app.get("/person/:id", (req, res) => {
-  const { id } = req.params;
-
-  db.query("SELECT * FROM personen WHERE id = ?", [id], (err, result) => {
-    if (err) return res.status(500).send("Fehler beim Abrufen der Person");
-    if (result.length === 0) return res.status(404).send("Person nicht gefunden");
-    res.status(200).json(result[0]);
-  });
-});
-
-// Route: DELETE /person/:id zum Löschen einer Person nach ID
-app.delete("/person/:id", (req, res) => {
-  const { id } = req.params;
-
-  db.query("DELETE FROM personen WHERE id = ?", [id], (err, result) => {
-    if (err) return res.status(500).send("Fehler beim Löschen der Person");
-    if (result.affectedRows === 0) return res.status(404).send("Person nicht gefunden");
-    res.status(200).send("Person gelöscht");
-  });
-});
-
-// Fallback-Route für nicht definierte Pfade
-app.use((req, res) => {
-  res.status(404).send("Route nicht gefunden");
-});
-
+// Server starten
 app.listen(port, () => {
   console.log(`Server läuft unter http://localhost:${port}`);
 });
