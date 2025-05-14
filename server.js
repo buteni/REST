@@ -3,13 +3,14 @@ const mysql = require("mysql2");
 const Ajv = require("ajv");
 const ajvFormats = require("ajv-formats");
 const dotenv = require("dotenv");
+const jwt = require("jsonwebtoken");
 
-dotenv.config(); // Lädt die Umgebungsvariablen aus der .env-Datei
-
+dotenv.config();
 const app = express();
 const port = 3000;
 
-// Datenbankverbindung mit mysql.createConnection() (wie in Code 2)
+const TOKEN_SECRET = process.env.TOKEN_SECRET;
+
 const db = mysql.createConnection({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -18,20 +19,22 @@ const db = mysql.createConnection({
   database: process.env.DB_NAME,
 });
 
-// Verbindung testen
 db.connect((err) => {
   if (err) {
     console.error("Datenbankverbindung fehlgeschlagen:", err);
-    process.exit(1); // Beendet den Server, wenn die Verbindung fehlschlägt
+    process.exit(1);
   }
   console.log("Mit MySQL verbunden!");
 });
 
-// AJV Schema-Validator mit Formaten
-const ajv = new Ajv();
-ajvFormats(ajv);  // Aktiviert alle Formate wie 'email', 'uri', etc.
+app.use(express.json());
 
-const schema = {
+// AJV Setup
+const ajv = new Ajv();
+ajvFormats(ajv);
+
+// Schema für Personen
+const personenSchema = {
   type: "object",
   properties: {
     vorname: { type: "string" },
@@ -40,68 +43,84 @@ const schema = {
     strasse: { type: "string" },
     ort: { type: "string" },
     telefonnummer: { type: "integer" },
-    email: { type: "string", format: "email" }  // Aktiviert die E-Mail-Validierung
+    email: { type: "string", format: "email" }
   },
-  required: ["vorname", "nachname", "email"], // Vorname, Nachname und Email sind erforderlich
+  required: ["vorname", "nachname", "email"],
   additionalProperties: false
 };
+const validatePerson = ajv.compile(personenSchema);
 
-const validate = ajv.compile(schema);
+// Token erstellen
+function generateAccessToken(username) {
+  return jwt.sign({ username }, TOKEN_SECRET, { expiresIn: "1800s" });
+}
 
-app.use(express.json());
+// LOGIN Route
+app.post("/user/login", (req, res) => {
+  const { username, password } = req.body;
+  const sql = "SELECT username, password FROM user WHERE username = ? AND password = ?";
+  db.query(sql, [username, password], (err, results) => {
+    if (err) return res.status(500).json({ message: "Datenbankfehler", error: err });
+    if (results.length === 0) return res.status(409).json({ message: "Falsche Login-Daten", status: 409 });
 
-// Route: Teste das JSON-Format mit AJV
-app.post("/validate", (req, res) => {
-  const data = req.body;
-
-  const valid = validate(data);
-  if (!valid) {
-    console.log(validate.errors);
-    return res.status(400).send({ message: "Ungültige Daten", errors: validate.errors });
-  }
-
-  return res.status(200).send({ message: "Daten sind gültig!" });
+    const token = generateAccessToken(username);
+    res.status(201).json({ token, status: 201, message: "Erfolgreich eingeloggt" });
+  });
 });
 
-// Route: POST /person für das Hinzufügen einer Person
+//ROUTEN
+
+// POST PERSON 
 app.post("/person", (req, res) => {
+  if (!validatePerson(req.body)) {
+    return res.status(400).json({ message: "Ungültige Daten", errors: validatePerson.errors });
+  }
+
   const { vorname, nachname, plz, strasse, ort, telefonnummer, email } = req.body;
-
-  // Validierung des Datenformats
-  const valid = validate(req.body);
-  if (!valid) {
-    return res.status(400).send({ message: "Ungültige Daten", errors: validate.errors });
-  }
-
-  if (!vorname || !nachname || !email) {
-    return res.status(400).send("Vorname, Nachname und E-Mail sind erforderlich");
-  }
-
   const query = `
     INSERT INTO personen (vorname, nachname, plz, strasse, ort, telefonnummer, email)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `;
   const values = [vorname, nachname, plz, strasse, ort, telefonnummer, email];
 
-  db.execute(query, values, (err, result) => {
-    if (err) {
-      console.error("Fehler beim Einfügen der Person:", err);
-      return res.status(500).send("Fehler beim Speichern der Person");
-    }
-    res.status(201).send({ message: "Person hinzugefügt", id: result.insertId });
+  db.query(query, values, (err, result) => {
+    if (err) return res.status(500).json({ message: "Fehler beim Speichern", error: err });
+    res.status(201).json({ message: "Person hinzugefügt", id: result.insertId });
   });
 });
 
-// Route: GET /person für das Abrufen aller Personen
+// GET PERSON 
 app.get("/person", (req, res) => {
-  const query = "SELECT * FROM personen";
+  db.query("SELECT * FROM personen", (err, results) => {
+    if (err) return res.status(500).json({ message: "Fehler beim Abrufen", error: err });
+    res.status(200).json(results);
+  });
+});
 
-  db.query(query, (err, rows) => {
-    if (err) {
-      console.error("Fehler beim Abrufen der Personen:", err);
-      return res.status(500).send("Fehler beim Abrufen der Personen");
-    }
-    res.status(200).json(rows);
+// PUT PERSON 
+app.put("/person/:id", (req, res) => {
+  if (!validatePerson(req.body)) {
+    return res.status(400).json({ message: "Ungültige Daten", errors: validatePerson.errors });
+  }
+
+  const { vorname, nachname, plz, strasse, ort, telefonnummer, email } = req.body;
+  const sql = `
+    UPDATE personen SET vorname=?, nachname=?, plz=?, strasse=?, ort=?, telefonnummer=?, email=? WHERE id=?
+  `;
+  const values = [vorname, nachname, plz, strasse, ort, telefonnummer, email, req.params.id];
+
+  db.query(sql, values, (err) => {
+    if (err) return res.status(500).json({ message: "Fehler beim Aktualisieren", error: err });
+    res.status(200).json({ message: "Person aktualisiert" });
+  });
+});
+
+// DELETE PERSON 
+app.delete("/person/:id", (req, res) => {
+  const sql = "DELETE FROM personen WHERE id = ?";
+  db.query(sql, [req.params.id], (err) => {
+    if (err) return res.status(500).json({ message: "Fehler beim Löschen", error: err });
+    res.status(200).json({ message: "Person gelöscht" });
   });
 });
 
