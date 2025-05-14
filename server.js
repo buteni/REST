@@ -1,5 +1,5 @@
 const express = require("express");
-const mysql = require("mysql2");
+const mysql = require("mysql2/promise");
 const Ajv = require("ajv");
 const ajvFormats = require("ajv-formats");
 const dotenv = require("dotenv");
@@ -8,10 +8,13 @@ const jwt = require("jsonwebtoken");
 dotenv.config();
 const app = express();
 const port = 3000;
-
 const TOKEN_SECRET = process.env.TOKEN_SECRET;
 
-const db = mysql.createConnection({
+app.use(express.json());
+
+// MySQL Pool erstellen
+const pool = mysql.createPool({
+  connectionLimit: 10,
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
   user: process.env.DB_USER,
@@ -19,21 +22,20 @@ const db = mysql.createConnection({
   database: process.env.DB_NAME,
 });
 
-db.connect((err) => {
-  if (err) {
-    console.error("Datenbankverbindung fehlgeschlagen:", err);
+// Verbindung testen
+(async () => {
+  try {
+    await pool.query("SELECT 1");
+    console.log("Mit MySQL verbunden!");
+  } catch (err) {
+    console.error("Fehler bei Verbindung zu MySQL:", err);
     process.exit(1);
   }
-  console.log("Mit MySQL verbunden!");
-});
-
-app.use(express.json());
+})();
 
 // AJV Setup
 const ajv = new Ajv();
 ajvFormats(ajv);
-
-// Schema für Personen
 const personenSchema = {
   type: "object",
   properties: {
@@ -55,50 +57,70 @@ function generateAccessToken(username) {
   return jwt.sign({ username }, TOKEN_SECRET, { expiresIn: "1800s" });
 }
 
-// LOGIN Route
-app.post("/user/login", (req, res) => {
+// Token prüfen
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.status(401).json({ message: "Kein Token", status: 401 });
+
+  jwt.verify(token, TOKEN_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: "Ungültiger Token", status: 403 });
+    req.user = user;
+    next();
+  });
+}
+
+// LOGIN-Route
+app.post("/user/login", async (req, res) => {
   const { username, password } = req.body;
   const sql = "SELECT username, password FROM user WHERE username = ? AND password = ?";
-  db.query(sql, [username, password], (err, results) => {
-    if (err) return res.status(500).json({ message: "Datenbankfehler", error: err });
-    if (results.length === 0) return res.status(409).json({ message: "Falsche Login-Daten", status: 409 });
+
+  try {
+    const [results] = await pool.query(sql, [username, password]);
+    if (results.length === 0) {
+      return res.status(409).json({ message: "Falsche Login-Daten", status: 409 });
+    }
 
     const token = generateAccessToken(username);
     res.status(201).json({ token, status: 201, message: "Erfolgreich eingeloggt" });
-  });
+  } catch (err) {
+    res.status(500).json({ message: "Datenbankfehler", error: err });
+  }
 });
 
-//ROUTEN
-
-// POST PERSON 
-app.post("/person", (req, res) => {
+// POST PERSON
+app.post("/person", authenticateToken, async (req, res) => {
   if (!validatePerson(req.body)) {
     return res.status(400).json({ message: "Ungültige Daten", errors: validatePerson.errors });
   }
 
   const { vorname, nachname, plz, strasse, ort, telefonnummer, email } = req.body;
-  const query = `
+  const sql = `
     INSERT INTO personen (vorname, nachname, plz, strasse, ort, telefonnummer, email)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `;
   const values = [vorname, nachname, plz, strasse, ort, telefonnummer, email];
 
-  db.query(query, values, (err, result) => {
-    if (err) return res.status(500).json({ message: "Fehler beim Speichern", error: err });
+  try {
+    const [result] = await pool.query(sql, values);
     res.status(201).json({ message: "Person hinzugefügt", id: result.insertId });
-  });
+  } catch (err) {
+    res.status(500).json({ message: "Fehler beim Speichern", error: err });
+  }
 });
 
-// GET PERSON 
-app.get("/person", (req, res) => {
-  db.query("SELECT * FROM personen", (err, results) => {
-    if (err) return res.status(500).json({ message: "Fehler beim Abrufen", error: err });
+// GET PERSON
+app.get("/person", authenticateToken, async (req, res) => {
+  try {
+    const [results] = await pool.query("SELECT * FROM personen");
     res.status(200).json(results);
-  });
+  } catch (err) {
+    res.status(500).json({ message: "Fehler beim Abrufen", error: err });
+  }
 });
 
-// PUT PERSON 
-app.put("/person/:id", (req, res) => {
+// PUT PERSON
+app.put("/person/:id", authenticateToken, async (req, res) => {
   if (!validatePerson(req.body)) {
     return res.status(400).json({ message: "Ungültige Daten", errors: validatePerson.errors });
   }
@@ -109,19 +131,22 @@ app.put("/person/:id", (req, res) => {
   `;
   const values = [vorname, nachname, plz, strasse, ort, telefonnummer, email, req.params.id];
 
-  db.query(sql, values, (err) => {
-    if (err) return res.status(500).json({ message: "Fehler beim Aktualisieren", error: err });
+  try {
+    await pool.query(sql, values);
     res.status(200).json({ message: "Person aktualisiert" });
-  });
+  } catch (err) {
+    res.status(500).json({ message: "Fehler beim Aktualisieren", error: err });
+  }
 });
 
-// DELETE PERSON 
-app.delete("/person/:id", (req, res) => {
-  const sql = "DELETE FROM personen WHERE id = ?";
-  db.query(sql, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ message: "Fehler beim Löschen", error: err });
+// DELETE PERSON
+app.delete("/person/:id", authenticateToken, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM personen WHERE id = ?", [req.params.id]);
     res.status(200).json({ message: "Person gelöscht" });
-  });
+  } catch (err) {
+    res.status(500).json({ message: "Fehler beim Löschen", error: err });
+  }
 });
 
 // Server starten
